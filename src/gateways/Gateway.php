@@ -6,7 +6,7 @@ use Craft;
 use craft\commerce\base\RequestResponseInterface;
 use craft\commerce\models\payments\BasePaymentForm;
 use craft\commerce\models\Transaction;
-use craft\commerce\multisafepay\gateways\RequestResponse as GatewaysRequestResponse;
+use craft\commerce\multisafepay\gateways\RequestResponse;
 use craft\commerce\omnipay\base\OffsiteGateway;
 use craft\commerce\omnipay\events\GatewayRequestEvent;
 use craft\helpers\App;
@@ -239,18 +239,18 @@ class Gateway extends OffsiteGateway
         $request = $this->createRequest($transaction);
         $completeRequest = $this->prepareCompletePurchaseRequest($request);
 
-        return $this->performRequestTest($completeRequest, $transaction);
+        return $this->performGatewayRequest($completeRequest, $transaction);
     }
 
     /**
-     * Perform a request and return the response.
+     * Perform a gateway request and return the response.
      *
      * @param RequestInterface $request
      * @param Transaction $transaction
      *
      * @return RequestResponseInterface
      */
-    protected function performRequestTest(RequestInterface $request, Transaction $transaction): RequestResponseInterface
+    private function performGatewayRequest(RequestInterface $request, Transaction $transaction): RequestResponseInterface
     {
         //raising event
         $event = new GatewayRequestEvent([
@@ -261,12 +261,11 @@ class Gateway extends OffsiteGateway
 
         // Raise 'beforeGatewayRequestSend' event
         $this->trigger(self::EVENT_BEFORE_GATEWAY_REQUEST_SEND, $event);
-
         $response = $this->sendRequest($request);
-        file_put_contents('test.log', print_r($response, true));
 
-        return new GatewaysRequestResponse($response, $transaction);
+        return new RequestResponse($response, $transaction);
     }
+
 
     /**
      * @inheritdoc
