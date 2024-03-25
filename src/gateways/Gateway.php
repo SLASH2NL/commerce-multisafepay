@@ -6,13 +6,19 @@ use Craft;
 use craft\commerce\base\RequestResponseInterface;
 use craft\commerce\models\payments\BasePaymentForm;
 use craft\commerce\models\Transaction;
+use craft\commerce\multisafepay\gateways\RequestResponse as GatewaysRequestResponse;
 use craft\commerce\omnipay\base\OffsiteGateway;
+use craft\commerce\omnipay\events\GatewayRequestEvent;
 use craft\helpers\App;
 use craft\helpers\Json;
 use Omnipay\Common\AbstractGateway;
 use Omnipay\MultiSafepay\Message\RestRefundRequest;
 use Omnipay\MultiSafepay\RestGateway as OmnipayGateway;
 use yii\base\NotSupportedException;
+use craft\commerce\Plugin as Commerce;
+use craft\commerce\records\Transaction as TransactionRecord;
+use craft\web\Response;
+use Omnipay\Common\Message\RequestInterface;
 
 /**
  * Gateway represents MultiSafePay gateway
@@ -131,6 +137,143 @@ class Gateway extends OffsiteGateway
         return [
             'purchase' => Craft::t('commerce', 'Purchase (Authorize and Capture Immediately)'),
         ];
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function supportsWebhooks(): bool
+    {
+        return true;
+    }
+
+    /**
+     * @return Response
+     * @throws \Throwable
+     * @throws CurrencyException
+     * @throws OrderStatusException
+     * @throws TransactionException
+     * @throws ElementNotFoundException
+     * @throws Exception
+     * @throws InvalidConfigException
+     */
+    public function processWebHook(): Response
+    {
+        $response = Craft::$app->getResponse();
+
+        $transactionHash = $this->getTransactionHashFromWebhook();
+        $transaction = Commerce::getInstance()->getTransactions()->getTransactionByHash($transactionHash);
+
+        if (!$transaction) {
+            Craft::warning('Transaction with the hash “' . $transactionHash . '“ not found.', 'commerce');
+            $response->data = 'ok';
+
+            return $response;
+        }
+
+        // Check to see if a successful purchase child transaction already exist and skip out early if they do
+        $successfulPurchaseChildTransaction = TransactionRecord::find()->where([
+            'parentId' => $transaction->id,
+            'status' => TransactionRecord::STATUS_SUCCESS,
+            'type' => TransactionRecord::TYPE_PURCHASE,
+        ])->count();
+
+        if ($successfulPurchaseChildTransaction) {
+            Craft::warning('Successful child transaction for “' . $transactionHash . '“ already exists.', 'commerce');
+            $response->data = 'ok';
+
+            return $response;
+        }
+
+        $id = Craft::$app->getRequest()->getQueryParam('transactionid');
+
+        $gateway = $this->createGateway();
+        /** @var FetchTransactionRequest $request */
+        $request = $gateway->fetchTransaction(['transactionId' => $id]);
+
+        $res = $request->send();
+
+        if (!$res->isSuccessful()) {
+            Craft::warning('MSP request was unsuccessful.', 'commerce');
+            $response->data = 'ok';
+
+            return $response;
+        }
+
+        $childTransaction = Commerce::getInstance()->getTransactions()->createTransaction(null, $transaction);
+        $childTransaction->type = $transaction->type;
+
+        $status = $res->getPaymentStatus();
+
+        if ($status === 'completed') {
+            $childTransaction->status = TransactionRecord::STATUS_SUCCESS;
+        } elseif ($status === 'initialized' || $status === 'uncleared') {
+            $childTransaction->status = TransactionRecord::STATUS_PROCESSING;
+        } elseif ($res->isExpired() || $res->isDeclined() || $res->isCancelled()) {
+            $childTransaction->status = TransactionRecord::STATUS_FAILED;
+        } else {
+            $response->data = 'ok';
+            return $response;
+        }
+
+        $childTransaction->response = $res->getData();
+        $childTransaction->code = $res->getTransactionId();
+        $childTransaction->reference = $res->getTransactionReference();
+        $childTransaction->message = $res->getMessage();
+        Commerce::getInstance()->getTransactions()->saveTransaction($childTransaction);
+
+        $response->data = 'ok';
+
+        return $response;
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function completePurchase(Transaction $transaction): RequestResponseInterface
+    {
+        if (!$this->supportsCompletePurchase()) {
+            throw new NotSupportedException(Craft::t('commerce', 'Completing purchase is not supported by this gateway'));
+        }
+
+        $request = $this->createRequest($transaction);
+        $completeRequest = $this->prepareCompletePurchaseRequest($request);
+
+        return $this->performRequestTest($completeRequest, $transaction);
+    }
+
+    /**
+     * Perform a request and return the response.
+     *
+     * @param RequestInterface $request
+     * @param Transaction $transaction
+     *
+     * @return RequestResponseInterface
+     */
+    protected function performRequestTest(RequestInterface $request, Transaction $transaction): RequestResponseInterface
+    {
+        //raising event
+        $event = new GatewayRequestEvent([
+            'type' => $transaction->type,
+            'request' => $request,
+            'transaction' => $transaction,
+        ]);
+
+        // Raise 'beforeGatewayRequestSend' event
+        $this->trigger(self::EVENT_BEFORE_GATEWAY_REQUEST_SEND, $event);
+
+        $response = $this->sendRequest($request);
+        file_put_contents('test.log', print_r($response, true));
+
+        return new GatewaysRequestResponse($response, $transaction);
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function getTransactionHashFromWebhook(): ?string
+    {
+        return Craft::$app->getRequest()->getQueryParam('commerceTransactionHash');
     }
 
     /**
